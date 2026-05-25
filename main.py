@@ -1,7 +1,6 @@
 import argparse
 import multiprocessing
 import os
-import sys
 import torch
 
 
@@ -11,17 +10,18 @@ def main():
         "--mode", choices=["train", "watch", "demo"], required=True,
         help=(
             "train : headless fast training (SubprocVecEnv) | "
-            "watch : training with live 2D visualisation (DummyVecEnv) | "
+            "watch : training with live 2D visualisation | "
             "demo  : visualise a trained model"
         ),
     )
-    parser.add_argument("--model", default="models/best/best_model.zip",
-                        help="Trained model path (demo / watch-resume mode)")
+    parser.add_argument("--model",     default="models/best/best_model.zip")
     parser.add_argument("--timesteps", type=int, default=2_000_000)
-    parser.add_argument("--envs", type=int, default=8,
-                        help="Parallel env count (train=8 recommended, watch uses 8 always)")
-    parser.add_argument("--cars", type=int, default=8,
-                        help="Number of cars shown in demo / watch mode")
+    parser.add_argument("--envs",      type=int, default=8,
+                        help="Parallel env count for headless train mode")
+    parser.add_argument("--cars",      type=int, default=8,
+                        help="Number of cars to show (watch / demo)")
+    parser.add_argument("--speed",     type=int, default=1,
+                        help="Simulation speed multiplier (1=normal, 4=4x faster visually)")
     args = parser.parse_args()
 
     # ── train: headless, maximum speed ────────────────────────────────────────
@@ -41,21 +41,16 @@ def main():
         os.makedirs("models/best", exist_ok=True)
         os.makedirs("tensorboard_logs", exist_ok=True)
 
-        # Create envs explicitly so we can pass them to the renderer
         raw_envs = [CarEnv() for _ in range(n_cars)]
         for i, env in enumerate(raw_envs):
             env.reset(seed=i)
 
-        vec_env = DummyVecEnv([lambda e=env: e for env in raw_envs])
+        vec_env  = DummyVecEnv([lambda e=env: e for env in raw_envs])
         eval_env = VecMonitor(DummyVecEnv([lambda: CarEnv()]))
 
-        # MlpPolicy trains faster on CPU than MPS for small networks
-        device = "cpu"
-
-        # Try resuming from existing model
         if os.path.exists(args.model):
             print(f"Resuming from {args.model}")
-            model = PPO.load(args.model, env=vec_env, device=device)
+            model = PPO.load(args.model, env=vec_env, device="cpu")
         else:
             model = PPO(
                 "MlpPolicy", vec_env,
@@ -63,11 +58,11 @@ def main():
                 n_epochs=5, gamma=0.99, gae_lambda=0.95,
                 clip_range=0.2, ent_coef=0.01,
                 tensorboard_log="./tensorboard_logs/",
-                device=device, verbose=0,
+                device="cpu", verbose=0,
                 policy_kwargs=dict(net_arch=dict(pi=[256, 256], vf=[256, 256])),
             )
 
-        renderer = Simulator2D(envs=raw_envs, model=None)
+        renderer = Simulator2D(envs=raw_envs, model=None, speed=args.speed)
 
         checkpoint_cb = CheckpointCallback(
             save_freq=max(50_000 // n_cars, 1),
@@ -82,16 +77,18 @@ def main():
             deterministic=True,
             verbose=0,
         )
-        watch_cb = WatchCallback(renderer, render_fps=30)
+        watch_cb = WatchCallback(renderer, speed=args.speed, render_fps=30)
 
-        print(f"Watch mode: {n_cars} cars | device={device}")
-        print("Close the window or press ESC to stop.")
+        print(f"Watch mode: {n_cars} cars | speed={args.speed}x | device=cpu")
+        print("Press ESC or close window to stop.")
         model.learn(
             total_timesteps=args.timesteps,
             callback=[checkpoint_cb, eval_cb, watch_cb],
         )
         model.save("models/ppo_car_final")
         print("Saved: models/ppo_car_final.zip")
+        vec_env.close()
+        eval_env.close()
 
     # ── demo: load model, show N cars ─────────────────────────────────────────
     elif args.mode == "demo":
@@ -107,9 +104,9 @@ def main():
             model = PPO.load(args.model, device="cpu")
             print(f"Model loaded: {args.model}")
         else:
-            print(f"Model not found at {args.model} — using random actions.")
+            print(f"No model at {args.model} — using random actions.")
 
-        renderer = Simulator2D(envs=envs, model=model)
+        renderer = Simulator2D(envs=envs, model=model, speed=args.speed)
         renderer.run_demo()
 
 

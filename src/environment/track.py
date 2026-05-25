@@ -89,14 +89,12 @@ class Track:
         return (angle + math.pi) / (2 * math.pi)  # [0, 1]
 
     def get_start_pose(self):
-        # Bottom straight, slightly left of center, heading east
         start_y = -(self.OUTER_H + self.INNER_H) / 2
         return 0.0, start_y, 0.0  # x, y, heading_rad (0 = east)
 
-    def get_goal_position(self):
-        # Top straight center
-        goal_y = (self.OUTER_H + self.INNER_H) / 2
-        return 0.0, goal_y
+    def get_start_finish_line(self):
+        """Vertical line at x=0 crossing the bottom straight (start = finish)."""
+        return (0.0, -self.OUTER_H), (0.0, -self.INNER_H)
 
     @property
     def max_distance(self):
