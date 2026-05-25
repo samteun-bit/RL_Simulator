@@ -1,0 +1,5 @@
+panda3d==1.10.16
+stable-baselines3==2.8.0
+gymnasium==1.2.3
+numpy>=1.26
+tensorboard>=2.14
