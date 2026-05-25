@@ -45,7 +45,7 @@ def train(n_envs: int = 8, total_timesteps: int = 2_000_000):
         tensorboard_log="./tensorboard_logs/",
         device=device,
         verbose=1,
-        policy_kwargs=dict(net_arch=[dict(pi=[256, 256], vf=[256, 256])]),
+        policy_kwargs=dict(net_arch=dict(pi=[256, 256], vf=[256, 256])),
     )
 
     checkpoint_cb = CheckpointCallback(

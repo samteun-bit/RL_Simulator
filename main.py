@@ -49,7 +49,8 @@ def main():
         vec_env = DummyVecEnv([lambda e=env: e for env in raw_envs])
         eval_env = VecMonitor(DummyVecEnv([lambda: CarEnv()]))
 
-        device = "mps" if torch.backends.mps.is_available() else "cpu"
+        # MlpPolicy trains faster on CPU than MPS for small networks
+        device = "cpu"
 
         # Try resuming from existing model
         if os.path.exists(args.model):
@@ -63,7 +64,7 @@ def main():
                 clip_range=0.2, ent_coef=0.01,
                 tensorboard_log="./tensorboard_logs/",
                 device=device, verbose=0,
-                policy_kwargs=dict(net_arch=[dict(pi=[256, 256], vf=[256, 256])]),
+                policy_kwargs=dict(net_arch=dict(pi=[256, 256], vf=[256, 256])),
             )
 
         renderer = Simulator2D(envs=raw_envs, model=None)

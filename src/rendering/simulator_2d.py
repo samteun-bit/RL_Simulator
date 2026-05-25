@@ -179,6 +179,17 @@ class Simulator2D:
         self._draw_cars()
         self._draw_sidebar()
 
+    def draw_frame(self):
+        """Explicitly draw everything to screen (used by WatchCallback)."""
+        self.render()
+        self.window.clear()
+        self._static_batch.draw()
+        for s in self._dyn_shapes:
+            s.draw()
+        for lbl in self._sidebar_labels:
+            lbl.draw()
+        self.window.flip()
+
     def _draw_raycasts(self):
         for i, env in enumerate(self.envs):
             cs  = env.car_state
@@ -395,8 +406,7 @@ class WatchCallback(BaseCallback):
         # Throttle rendering to render_fps
         now = time.monotonic()
         if now - self._last_draw >= self.frame_dt:
-            self.renderer.render()
-            self.renderer.window.flip()
+            self.renderer.draw_frame()
             self._last_draw = now
 
         return True
