@@ -1,3 +1,11 @@
+"""
+2D top-down renderer for the RL car simulator.
+
+Performance design: ALL shapes are pre-allocated at init.
+Each frame only updates .x / .y / .rotation / .opacity / .text — zero
+GPU allocations during the render loop.
+"""
+
 import math
 import time
 import numpy as np
@@ -7,66 +15,39 @@ from stable_baselines3.common.callbacks import BaseCallback
 
 from src.environment.car_env import CarEnv, NUM_RAYS
 from src.environment.car import Car
+from src.environment.track import Track
 
 
-# ── Colours ───────────────────────────────────────────────────────────────────
-BG         = (18,  20,  28)
-TRACK_COL  = (52,  52,  52)
-GRASS_COL  = (32,  62,  32)
-WALL_COL   = (210, 190,  45)
-START_COL  = (255, 255, 255)   # start/finish line
-FINISH_COL = (240,  50,  50)   # checkered accent
+# ── Palette ───────────────────────────────────────────────────────────────────
+BG        = (18,  20,  28)
+TRACK_COL = (52,  52,  52)
+GRASS_COL = (32,  62,  32)
+WALL_COL  = (210, 190,  45)
 
 CAR_COLORS = [
-    (220,  60,  60),  # red
-    ( 60, 120, 220),  # blue
-    ( 60, 200,  80),  # green
-    (220, 140,  40),  # orange
-    (160,  60, 220),  # purple
-    ( 60, 200, 200),  # cyan
-    (220, 220,  60),  # yellow
-    (220, 100, 160),  # pink
-    (150, 220, 180),  # mint
-    (255, 140,  90),  # salmon
-    ( 90, 160, 255),  # sky blue
-    (200, 100, 255),  # lavender
+    (220,  60,  60), ( 60, 120, 220), ( 60, 200,  80), (220, 140,  40),
+    (160,  60, 220), ( 60, 200, 200), (220, 220,  60), (220, 100, 160),
+    (150, 220, 180), (255, 140,  90), ( 90, 160, 255), (200, 100, 255),
 ]
 
 SCREEN_W = 1280
 SCREEN_H = 800
 
 
-# ── Helper ────────────────────────────────────────────────────────────────────
-
-def _rotated_rect_verts(cx, cy, length, width, heading):
-    cos_h, sin_h = math.cos(heading), math.sin(heading)
-    hl, hw = length / 2, width / 2
-    corners = [(hl, -hw), (hl, hw), (-hl, hw), (-hl, -hw)]
-    return [(cx + x * cos_h - y * sin_h,
-             cy + x * sin_h + y * cos_h) for x, y in corners]
-
-
 # ── Renderer ──────────────────────────────────────────────────────────────────
 
 class Simulator2D:
-    """
-    Full-screen top-down 2D renderer. No stats sidebar.
-
-    demo  – model drives N cars at `speed` steps per visual frame.
-    watch – called by WatchCallback inside PPO.learn().
-    """
-
     def __init__(self, envs: list, model=None, speed: int = 1):
         self.envs    = envs
         self.model   = model
-        self.speed   = max(1, speed)   # physics steps per visual frame
+        self.speed   = max(1, speed)
         self.n_cars  = len(envs)
         self.should_stop = False
 
-        self.obs       = [None]         * self.n_cars
-        self.actions   = [np.zeros(2)]  * self.n_cars
-        self.ep_count  = [0]            * self.n_cars
-        self.ep_reward = [0.0]          * self.n_cars
+        self.obs       = [None]        * self.n_cars
+        self.actions   = [np.zeros(2)] * self.n_cars
+        self.ep_count  = [0]           * self.n_cars
+        self.ep_reward = [0.0]         * self.n_cars
 
         self.window = pyglet.window.Window(
             SCREEN_W, SCREEN_H,
@@ -74,7 +55,6 @@ class Simulator2D:
         )
         pyglet.gl.glClearColor(*[c / 255 for c in BG], 1.0)
 
-        # Scale: fit track in full window
         track  = envs[0].track
         margin = 55
         self.scale = min(
@@ -84,21 +64,19 @@ class Simulator2D:
         self.ox = SCREEN_W // 2
         self.oy = SCREEN_H // 2
 
-        self._static_batch  = pyglet.graphics.Batch()
-        self._static_shapes: list = []
-        self._dyn_shapes:    list = []
-        self._hud_labels:    list = []
+        # Two batches: static geometry + dynamic (cars / rays / hud)
+        self._static_batch = pyglet.graphics.Batch()
+        self._dyn_batch    = pyglet.graphics.Batch()
 
+        self._static_shapes: list = []   # kept alive to prevent GC
         self._build_static()
+        self._build_dynamic()            # pre-allocate all per-frame shapes
 
         @self.window.event
         def on_draw():
             self.window.clear()
             self._static_batch.draw()
-            for s in self._dyn_shapes:
-                s.draw()
-            for lbl in self._hud_labels:
-                lbl.draw()
+            self._dyn_batch.draw()
 
         @self.window.event
         def on_key_press(symbol, _):
@@ -110,12 +88,12 @@ class Simulator2D:
         def on_close():
             self.should_stop = True
 
-    # ── coords ────────────────────────────────────────────────────────────────
+    # ── helpers ───────────────────────────────────────────────────────────────
 
     def w2s(self, wx, wy):
         return (self.ox + wx * self.scale, self.oy + wy * self.scale)
 
-    # ── static geometry ───────────────────────────────────────────────────────
+    # ── static geometry (drawn once, never rebuilt) ───────────────────────────
 
     def _build_static(self):
         track = self.envs[0].track
@@ -143,125 +121,146 @@ class Simulator2D:
             p1, p2 = self.w2s(ax, ay), self.w2s(bx, by)
             s.append(shapes.Line(*p1, *p2, thickness=3, color=WALL_COL, batch=b))
 
-        # ── Start / Finish line ───────────────────────────────────────────────
+        # Start / Finish line — checkered blocks
         (sx1, sy1), (sx2, sy2) = track.get_start_finish_line()
         p1, p2 = self.w2s(sx1, sy1), self.w2s(sx2, sy2)
-        seg_len = math.sqrt((p2[0]-p1[0])**2 + (p2[1]-p1[1])**2)
-        n_checks = max(4, int(seg_len / 12))
-
-        # Alternating white / red checkered blocks along the line
-        dx = (p2[0] - p1[0]) / n_checks
-        dy = (p2[1] - p1[1]) / n_checks
-        stripe_w = int(self.scale * 1.2)
-        for k in range(n_checks):
-            col = START_COL if k % 2 == 0 else FINISH_COL
-            ex = p1[0] + dx * (k + 0.5)
-            ey = p1[1] + dy * (k + 0.5)
-            block_len = math.sqrt(dx**2 + dy**2)
-            # Vertical-ish stripe at each checkpoint position
+        seg_px = math.sqrt((p2[0]-p1[0])**2 + (p2[1]-p1[1])**2)
+        n_chk  = max(4, int(seg_px / 12))
+        dx, dy = (p2[0]-p1[0])/n_chk, (p2[1]-p1[1])/n_chk
+        sw     = max(4, int(self.scale * 1.1))
+        for k in range(n_chk):
+            col = (255, 255, 255) if k % 2 == 0 else (220, 40, 40)
+            ex  = p1[0] + dx * (k + 0.5)
+            ey  = p1[1] + dy * (k + 0.5)
+            bk  = math.sqrt(dx**2 + dy**2)
             s.append(shapes.Rectangle(
-                int(ex - stripe_w // 2), int(ey - block_len // 2),
-                stripe_w, int(block_len),
+                int(ex - sw//2), int(ey - bk//2),
+                sw, max(1, int(bk)),
                 color=col, batch=b,
             ))
-
-        # "START / FINISH" label
-        mx = (p1[0] + p2[0]) / 2 + 14
-        my = (p1[1] + p2[1]) / 2
+        # S/F text label
+        mx, my = (p1[0]+p2[0])/2 + 14, (p1[1]+p2[1])/2
         s.append(pyglet.text.Label(
-            "S/F",
-            font_name="Arial", font_size=11, weight="bold",
+            "S/F", font_name="Arial", font_size=11, weight="bold",
             x=int(mx), y=int(my),
             color=(255, 255, 255, 200),
-            anchor_x="left", anchor_y="center",
-            batch=b,
+            anchor_x="left", anchor_y="center", batch=b,
         ))
 
-    # ── dynamic rendering ─────────────────────────────────────────────────────
+    # ── pre-allocate all dynamic shapes (no per-frame allocation) ─────────────
 
-    def _clear_dynamic(self):
-        for s in self._dyn_shapes:
-            s.delete()
-        for lbl in self._hud_labels:
-            lbl.delete()
-        self._dyn_shapes  = []
-        self._hud_labels  = []
+    def _build_dynamic(self):
+        b  = self._dyn_batch
+        L  = Car.LENGTH * self.scale
+        W  = max(Car.WIDTH * self.scale, 5)
 
-    def render(self):
-        self._clear_dynamic()
-        self._draw_raycasts()
-        self._draw_cars()
-        self._draw_hud()
+        self._car_bodies:  list = []
+        self._car_fronts:  list = []   # direction arrow lines
+        self._ray_lines:   list = []   # list of lists
+        self._car_labels:  list = []
 
-    def draw_frame(self):
-        """Explicitly draw everything – used by WatchCallback."""
-        self.render()
-        self.window.clear()
-        self._static_batch.draw()
-        for s in self._dyn_shapes:
-            s.draw()
-        for lbl in self._hud_labels:
-            lbl.draw()
-        self.window.flip()
-
-    def _draw_raycasts(self):
-        for i, env in enumerate(self.envs):
-            cs  = env.car_state
+        for i in range(self.n_cars):
             col = CAR_COLORS[i % len(CAR_COLORS)]
             dim = tuple(max(0, c - 130) for c in col)
+
+            # Body rectangle — anchor at centre so rotation works correctly
+            body = shapes.Rectangle(0, 0, L, W, color=(*col, 230), batch=b)
+            body.anchor_x = L / 2
+            body.anchor_y = W / 2
+            self._car_bodies.append(body)
+
+            # Front indicator: white line from centre toward front
+            front = shapes.Line(0, 0, 1, 1, thickness=3,
+                                color=(255, 255, 255, 210), batch=b)
+            self._car_fronts.append(front)
+
+            # Raycast lines
+            car_rays = []
+            for _ in range(NUM_RAYS):
+                ray = shapes.Line(0, 0, 1, 1, thickness=1,
+                                  color=(*dim, 80), batch=b)
+                car_rays.append(ray)
+            self._ray_lines.append(car_rays)
+
+            # Car number label
+            lbl = pyglet.text.Label(
+                str(i + 1), font_name="Arial", font_size=9,
+                x=0, y=0,
+                color=(255, 255, 255, 220),
+                anchor_x="center", anchor_y="center",
+                batch=b,
+            )
+            self._car_labels.append(lbl)
+
+        # HUD — single label, text updated each frame
+        self._hud_lbl = pyglet.text.Label(
+            "", font_name="Courier New", font_size=12,
+            x=14, y=SCREEN_H - 18,
+            color=(200, 200, 200, 200),
+            anchor_y="center", batch=b,
+        )
+
+    # ── per-frame update (zero allocation) ───────────────────────────────────
+
+    def render(self):
+        L       = Car.LENGTH * self.scale
+        RAY_MAX = self.envs[0].track.RAY_MAX_DIST
+
+        for i, env in enumerate(self.envs):
+            cs    = env.car_state
+            cx, cy = self.w2s(cs.x, cs.y)
+            cos_h  = math.cos(cs.heading)
+            sin_h  = math.sin(cs.heading)
+
+            # Body: update position and rotation
+            body = self._car_bodies[i]
+            body.x        = cx
+            body.y        = cy
+            body.rotation = -math.degrees(cs.heading)  # pyglet = CW
+
+            # Front arrow
+            fl = self._car_fronts[i]
+            fl.x  = cx;           fl.y  = cy
+            fl.x2 = cx + (L/2 - 1) * cos_h
+            fl.y2 = cy + (L/2 - 1) * sin_h
+
+            # Raycasts — compute hit from stored obs (no extra raycast calls)
             rays = (self.obs[i][:NUM_RAYS] if self.obs[i] is not None
                     else [1.0] * NUM_RAYS)
-            angles = np.linspace(
+            ray_angles = np.linspace(
                 cs.heading - math.pi / 2,
                 cs.heading + math.pi / 2,
                 NUM_RAYS,
             )
-            for dist_n, angle in zip(rays, angles):
-                hx, hy, _ = env.track.cast_ray_world(cs.x, cs.y, angle)
-                p1, p2 = self.w2s(cs.x, cs.y), self.w2s(hx, hy)
-                alpha = int(55 + 90 * (1 - dist_n))
-                self._dyn_shapes.append(
-                    shapes.Line(*p1, *p2, thickness=1, color=(*dim, alpha))
-                )
-
-    def _draw_cars(self):
-        L = Car.LENGTH * self.scale
-        W = max(Car.WIDTH * self.scale, 5)
-
-        for i, env in enumerate(self.envs):
-            cs  = env.car_state
-            col = CAR_COLORS[i % len(CAR_COLORS)]
-            cx, cy = self.w2s(cs.x, cs.y)
-
-            # Body
-            body_v = _rotated_rect_verts(cx, cy, L, W, cs.heading)
-            self._dyn_shapes.append(shapes.Polygon(*body_v, color=(*col, 230)))
-
-            # White front stripe (marks front of car)
-            cos_h, sin_h = math.cos(cs.heading), math.sin(cs.heading)
-            fc = (cx + L * 0.32 * cos_h, cy + L * 0.32 * sin_h)
-            front_v = _rotated_rect_verts(*fc, L * 0.24, W * 0.94, cs.heading)
-            self._dyn_shapes.append(shapes.Polygon(*front_v, color=(255, 255, 255, 210)))
+            for k, (dist_n, angle) in enumerate(zip(rays, ray_angles)):
+                d   = dist_n * RAY_MAX
+                hx  = cs.x + d * math.cos(angle)
+                hy  = cs.y + d * math.sin(angle)
+                p1  = self.w2s(cs.x, cs.y)
+                p2  = self.w2s(hx, hy)
+                ray = self._ray_lines[i][k]
+                ray.x = p1[0]; ray.y = p1[1]
+                ray.x2 = p2[0]; ray.y2 = p2[1]
+                ray.opacity = int(50 + 90 * (1 - dist_n))
 
             # Car number
-            self._hud_labels.append(pyglet.text.Label(
-                str(i + 1),
-                font_name="Arial", font_size=9,
-                x=int(cx), y=int(cy),
-                color=(255, 255, 255, 220),
-                anchor_x="center", anchor_y="center",
-            ))
+            lbl   = self._car_labels[i]
+            lbl.x = int(cx)
+            lbl.y = int(cy)
 
-    def _draw_hud(self):
-        """Minimal top-left info: cars, laps, speed multiplier."""
+        # HUD
         total_laps = sum(self.ep_count)
-        self._hud_labels.append(pyglet.text.Label(
-            f"Cars: {self.n_cars}   Laps: {total_laps}   Speed: {self.speed}x",
-            font_name="Courier New", font_size=12,
-            x=14, y=SCREEN_H - 18,
-            color=(200, 200, 200, 200),
-            anchor_y="center",
-        ))
+        self._hud_lbl.text = (
+            f"Cars: {self.n_cars}   Laps: {total_laps}   Speed: {self.speed}x"
+        )
+
+    def draw_frame(self):
+        """Used by WatchCallback — explicit draw (on_draw not called by SB3)."""
+        self.render()
+        self.window.clear()
+        self._static_batch.draw()
+        self._dyn_batch.draw()
+        self.window.flip()
 
     # ── demo mode ─────────────────────────────────────────────────────────────
 
@@ -273,7 +272,7 @@ class Simulator2D:
             self.obs[i] = obs
 
         def update(_dt):
-            for _ in range(self.speed):          # speed multiplier
+            for _ in range(self.speed):
                 for i, env in enumerate(self.envs):
                     act = (self.model.predict(self.obs[i], deterministic=True)[0]
                            if self.model else env.action_space.sample())
@@ -285,7 +284,7 @@ class Simulator2D:
                         self.ep_count[i]  += 1
                         self.ep_reward[i]  = 0.0
                         self.obs[i], _     = env.reset()
-            self.render()
+            self.render()   # shapes updated in-place; on_draw draws them
 
         pyglet.clock.schedule_interval(update, 1 / 60)
         pyglet.app.run()
@@ -294,12 +293,9 @@ class Simulator2D:
 # ── SB3 training callback ─────────────────────────────────────────────────────
 
 class WatchCallback(BaseCallback):
-    """Renders training environments during PPO.learn()."""
-
     def __init__(self, renderer: Simulator2D, speed: int = 1, render_fps: int = 30):
         super().__init__()
-        self.renderer   = renderer
-        # render every `render_every` steps (higher speed → skip more renders)
+        self.renderer     = renderer
         self.render_every = max(1, speed)
         self.frame_dt     = 1.0 / render_fps
         self._last_draw   = 0.0
@@ -311,19 +307,16 @@ class WatchCallback(BaseCallback):
         if self.renderer.should_stop:
             return False
 
-        # Sync actions
         acts = self.locals.get("clipped_actions", self.locals.get("actions"))
         if acts is not None:
             for i in range(min(len(acts), self.renderer.n_cars)):
                 self.renderer.actions[i] = np.asarray(acts[i])
 
-        # Sync observations
         new_obs = self.locals.get("new_obs")
         if new_obs is not None:
             for i in range(min(len(new_obs), self.renderer.n_cars)):
                 self.renderer.obs[i] = new_obs[i]
 
-        # Episode stats
         for i, (rew, done) in enumerate(zip(
             self.locals.get("rewards", []),
             self.locals.get("dones",   []),
@@ -335,7 +328,6 @@ class WatchCallback(BaseCallback):
                 self.renderer.ep_count[i]  += 1
                 self.renderer.ep_reward[i]  = 0.0
 
-        # Render at throttled rate, skipping frames based on speed
         if self._call_count % self.render_every != 0:
             return True
         now = time.monotonic()
